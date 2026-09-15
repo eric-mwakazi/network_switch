@@ -1,7 +1,7 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdbool.h>
+#include "define.h"
+
+// Number of switch ports and simulated NICs connected to them.
+#define NIC_COUNT 4
 
 // Structure for a MAC address table entry
 typedef struct MacEntry {
@@ -15,13 +15,31 @@ typedef struct {
     char src_mac[18];
     char dest_mac[18];
     int ingress_port;
-    char payload[64];
+    char payload[128];
 } EthernetFrame;
+
+// A virtual NIC represents one host connected to one switch port.
+typedef struct {
+    char name[8];
+    char host_mac[18];
+    int port;
+    unsigned long received_frames;
+} SimulatedNic;
 
 // Global pointer for the dynamic MAC address table
 MacEntry* mac_table = NULL;
 
-// Function to update or add an entry to the MAC table (Learning Phase)
+// Static topology used by the simulation.
+SimulatedNic nics[NIC_COUNT] = {
+    {"nic1", "00:AA:BB:CC:DD:01", 1, 0},
+    {"nic2", "00:AA:BB:CC:DD:02", 2, 0},
+    {"nic3", "00:AA:BB:CC:DD:03", 3, 0},
+    {"nic4", "00:AA:BB:CC:DD:04", 4, 0}
+};
+
+/* 
+ * Function to update or add an entry to the MAC table (Learning Phase)
+ */
 void learn_mac(const char* mac, int port) {
     MacEntry* current = mac_table;
 
@@ -64,10 +82,48 @@ int lookup_mac(const char* mac) {
     return -1; 
 }
 
+SimulatedNic* find_nic_by_name(const char* name) {
+    for (int i = 0; i < NIC_COUNT; i++) {
+        if (strcmp(nics[i].name, name) == 0) {
+            return &nics[i];
+        }
+    }
+    return NULL;
+}
+
+// Simulate placing a frame on an egress NIC and the connected host receiving it.
+void transmit_to_nic(int port, const EthernetFrame* frame) {
+    for (int i = 0; i < NIC_COUNT; i++) {
+        if (nics[i].port != port) {
+            continue;
+        }
+
+        nics[i].received_frames++;
+        printf("[TX] switch -> %s | %s -> %s | Data: %s\n",
+               nics[i].name, frame->src_mac, frame->dest_mac, frame->payload);
+        if (strcmp(frame->dest_mac, nics[i].host_mac) == 0 ||
+            strcmp(frame->dest_mac, "FF:FF:FF:FF:FF:FF") == 0) {
+            printf("[HOST %s] Accepted frame\n", nics[i].name);
+        } else {
+            printf("[HOST %s] Ignored frame for another MAC\n", nics[i].name);
+        }
+        return;
+    }
+}
+
+// Unknown and broadcast traffic leaves every port except the ingress port.
+void flood_frame(const EthernetFrame* frame) {
+    for (int i = 0; i < NIC_COUNT; i++) {
+        if (nics[i].port != frame->ingress_port) {
+            transmit_to_nic(nics[i].port, frame);
+        }
+    }
+}
+
 // Function to process an incoming frame
 void process_frame(EthernetFrame frame) {
-    printf("\n--- Incoming Frame on Port %d ---\n", frame.ingress_port);
-    printf("SRC: %s | DEST: %s | Data: %s\n", frame.src_mac, frame.dest_mac, frame.payload);
+    printf("\n[RX] nic%d -> switch | %s -> %s | Data: %s\n",
+           frame.ingress_port, frame.src_mac, frame.dest_mac, frame.payload);
 
     // 1. Learning Phase
     learn_mac(frame.src_mac, frame.ingress_port);
@@ -75,7 +131,8 @@ void process_frame(EthernetFrame frame) {
     // 2. Forwarding / Filtering Phase
     // Check if it's a broadcast frame
     if (strcmp(frame.dest_mac, "FF:FF:FF:FF:FF:FF") == 0) {
-        printf("[FORWARD] Broadcast Frame! Flooding to all ports except Port %d\n", frame.ingress_port);
+        printf("[SWITCH] Broadcast: flooding all NICs except nic%d\n", frame.ingress_port);
+        flood_frame(&frame);
         return;
     }
 
@@ -83,13 +140,15 @@ void process_frame(EthernetFrame frame) {
 
     if (dest_port == -1) {
         // Destination MAC unknown
-        printf("[FORWARD] Destination MAC unknown. Flooding frame to all ports except Port %d\n", frame.ingress_port);
+        printf("[SWITCH] Unknown destination: flooding all NICs except nic%d\n", frame.ingress_port);
+        flood_frame(&frame);
     } else if (dest_port == frame.ingress_port) {
         // Destination is on the same port as source (Filtering)
-        printf("[FILTER] Destination port matches ingress port. Frame dropped.\n");
+        printf("[SWITCH] Destination is on ingress NIC: frame filtered\n");
     } else {
         // Destination MAC known (Unicast Forwarding)
-        printf("[FORWARD] Unicast Frame directly to Port %d\n", dest_port);
+        printf("[SWITCH] Known destination: forwarding only to nic%d\n", dest_port);
+        transmit_to_nic(dest_port, &frame);
     }
 }
 
@@ -109,6 +168,25 @@ void print_mac_table() {
     printf("=================================\n");
 }
 
+void print_nics(void) {
+    printf("\n======= SIMULATED NICs =======\n");
+    for (int i = 0; i < NIC_COUNT; i++) {
+        printf("%-4s | Port %d | Host %s | Received %lu\n",
+               nics[i].name, nics[i].port, nics[i].host_mac,
+               nics[i].received_frames);
+    }
+    printf("==============================\n");
+}
+
+void print_help(void) {
+    printf("Commands:\n");
+    printf("  send <source-nic> <dest-nic|broadcast|MAC> <message>\n");
+    printf("  nics     Show NICs and receive counters\n");
+    printf("  table    Show the learned MAC table\n");
+    printf("  help     Show this help\n");
+    printf("  quit     Stop the simulation\n");
+}
+
 // Free allocated memory before exit
 void free_mac_table() {
     MacEntry* current = mac_table;
@@ -119,27 +197,79 @@ void free_mac_table() {
     }
 }
 
-int main() {
-    // Array of mock sequential frames simulating network traffic
-    EthernetFrame traffic[] = {
-        {"00:AA:BB:CC:DD:01", "FF:FF:FF:FF:FF:FF", 1, "Hello Network (Broadcast)"}, // PC1 broadcasts
-        {"00:AA:BB:CC:DD:02", "00:AA:BB:CC:DD:01", 2, "Reply to PC1 (Unicast)"},     // PC2 replies to PC1
-        {"00:AA:BB:CC:DD:03", "00:AA:BB:CC:DD:02", 3, "Msg to PC2 (Unicast)"},      // PC3 sends to PC2 (PC2 is known)
-        {"00:AA:BB:CC:DD:01", "00:AA:BB:CC:DD:03", 1, "Msg to PC3 (Unicast)"},      // PC1 sends to PC3 (PC3 is known)
-        {"00:AA:BB:CC:DD:04", "00:AA:BB:CC:DD:05", 4, "Unknown to Unknown"},        // PC4 sends to an unknown PC5
-        {"00:AA:BB:CC:DD:01", "00:AA:BB:CC:DD:02", 1, "Duplicate local frame"}       // PC1 attempts to reach PC2 on port 1
-    };
+int main(void) {
+    char line[256];
 
-    int total_frames = sizeof(traffic) / sizeof(traffic[0]);
+    printf("Layer 2 switch simulation with %d NICs\n", NIC_COUNT);
+    print_nics();
+    print_help();
 
-    for (int i = 0; i < total_frames; i++) {
-        process_frame(traffic[i]);
+    while (true) {
+        char command[16];
+        char source_name[16];
+        char destination[18];
+        char payload[128];
+        int fields;
+
+        printf("\nswitch> ");
+        if (fgets(line, sizeof(line), stdin) == NULL) {
+            break;
+        }
+
+        // Keep the payload intact by parsing only the first three whitespace-separated fields.
+        fields = sscanf(line, "%15s %15s %17s %127[^\n]",
+                        command, source_name, destination, payload);
+        if (fields < 1) {
+            continue;
+        }
+
+        if (strcmp(command, "quit") == 0 || strcmp(command, "exit") == 0) {
+            break;
+        } else if (strcmp(command, "help") == 0) {
+            print_help();
+        } else if (strcmp(command, "nics") == 0) {
+            print_nics();
+        } else if (strcmp(command, "table") == 0) {
+            print_mac_table();
+        } else if (strcmp(command, "send") == 0) {
+            SimulatedNic* source;
+            SimulatedNic* destination_nic;
+            EthernetFrame frame;
+
+            if (fields != 4) {
+                printf("Usage: send <source-nic> <dest-nic|broadcast|MAC> <message>\n");
+                continue;
+            }
+
+            source = find_nic_by_name(source_name);
+            if (source == NULL) {
+                printf("Unknown source NIC '%s'. Use nic1 through nic%d.\n",
+                       source_name, NIC_COUNT);
+                continue;
+            }
+
+            // NIC names are a convenience alias for their connected host MAC address.
+            destination_nic = find_nic_by_name(destination);
+            strncpy(frame.src_mac, source->host_mac, sizeof(frame.src_mac));
+            if (destination_nic != NULL) {
+                strncpy(frame.dest_mac, destination_nic->host_mac, sizeof(frame.dest_mac));
+            } else if (strcmp(destination, "broadcast") == 0) {
+                strncpy(frame.dest_mac, "FF:FF:FF:FF:FF:FF", sizeof(frame.dest_mac));
+            } else {
+                strncpy(frame.dest_mac, destination, sizeof(frame.dest_mac));
+            }
+            strncpy(frame.payload, payload, sizeof(frame.payload));
+            frame.src_mac[sizeof(frame.src_mac) - 1] = '\0';
+            frame.dest_mac[sizeof(frame.dest_mac) - 1] = '\0';
+            frame.payload[sizeof(frame.payload) - 1] = '\0';
+            frame.ingress_port = source->port;
+            process_frame(frame);
+        } else {
+            printf("Unknown command '%s'. Type 'help'.\n", command);
+        }
     }
 
-    // Print final learned switch state
-    print_mac_table();
-
-    // Clean up memory
     free_mac_table();
+    printf("\nSimulation stopped.\n");
     return 0;
 }
